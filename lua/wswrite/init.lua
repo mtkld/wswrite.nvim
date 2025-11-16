@@ -1,109 +1,132 @@
+local uv = vim.loop
 local M = {}
 
--- Default configuration
-M.config = {
-	-- You have to manually create the named pipe, mkfifo /tmp/websocket-pipe
-	pipe_path = "/tmp/wswrited-pipe", -- Default pipe path
-}
+M.config = { pipe_path = "/tmp/wswrited-pipe" }
 
--- Setup function to configure the plugin
-function M.setup(config)
-	-- Merge user config with default config
-	M.config = vim.tbl_deep_extend("force", M.config, config or {})
+function M.setup(cfg)
+	M.config = vim.tbl_deep_extend("force", M.config, cfg or {})
 end
 
--- The wrapper function log
-function M.log(...)
-	local args = { ... }
+-- ───────────────── internal state ─────────────────
+local fd = nil -- writer fd
+local queue = {} -- pending messages
+local writing = false -- write in flight?
+local opening = false -- currently trying to open?
+local dummy_pid = nil -- pid of dummy reader
+local open_timer = nil -- uv timer handle
+-- --------------------------------------------------
 
-	-- Initialize the log_args table
-	local log_args = {}
+-- helper: start a dummy reader that just holds the pipe open
+local function ensure_dummy_reader()
+	if dummy_pid then
+		return
+	end
+	dummy_pid = uv.spawn("sh", {
+		args = { "-c", string.format("exec < %s &", M.config.pipe_path) },
+		stdio = { nil, nil, nil },
+	}, function()
+		dummy_pid = nil
+	end)
+end
 
-	-- Initialize a table to collect stack trace
-	local stack_trace = {}
-
-	-- Loop through the call stack, starting from level 2 (the immediate caller)
-	local level = 2
-	while true do
-		local info = debug.getinfo(level, "Sn") -- 'S' for source (module), 'n' for function name
-		if not info then
-			break -- No more stack frames
+-- async attempt to open the fifo for write
+local function try_open_pipe()
+	if fd or opening then
+		return
+	end
+	opening = true
+	-- run in thread pool so it can block without freezing UI
+	uv.fs_open(M.config.pipe_path, "a", 438, function(err, handle)
+		opening = false
+		if not err and handle then
+			fd = handle
+			-- flush anything that queued up
+			vim.schedule(function()
+				M._flush_queue()
+			end)
+		else
+			-- schedule next attempt
+			open_timer:start(500, 0, try_open_pipe) -- try again in 500 ms
 		end
-
-		-- Get the function name, use "<unknown>" if not available
-		local func_name = info.name or "<unknown>"
-
-		-- Get the source (module or file), use "<unknown>" if not available
-		local source = info.short_src or "<unknown>"
-
-		-- Format as "funcName{path}"
-		local formatted_entry = func_name .. "\r" .. source
-
-		-- Add the formatted entry to the stack trace
-		table.insert(stack_trace, formatted_entry)
-
-		level = level + 1 -- Move up to the next level in the call stack
-	end
-
-	-- Reverse the stack trace to have it from the root to the current function
-	for i = #stack_trace, 1, -1 do
-		table.insert(log_args, stack_trace[i])
-	end
-
-	-- Append original arguments to the log_args table
-	for i = 1, select("#", ...) do
-		table.insert(log_args, select(i, ...))
-	end
-
-	-- Call the write function with the modified arguments
-	M.write(unpack(log_args))
+	end)
 end
 
--- Function to write to the named pipe
+-- write next queued msg (must run on main loop)
+function M._flush_queue()
+	if writing or not fd or #queue == 0 then
+		return
+	end
+	writing = true
+	local msg = table.remove(queue, 1) .. "\n"
+	uv.fs_write(fd, msg, -1, function(_, err)
+		writing = false
+		if err then
+			vim.schedule(function()
+				vim.notify("pipe write error: " .. err, vim.log.levels.WARN)
+			end)
+			-- drop handle and retry open path
+			uv.fs_close(fd)
+			fd = nil
+			try_open_pipe()
+			return
+		end
+		M._flush_queue() -- keep flushing
+	end)
+end
+
+-- public write
 function M.write(...)
-	local args = { ... }
-	local arg_count = #args
+	-- 1. format msg and queue immediately (never blocks)
+	local msg = table.concat(
+		vim.tbl_map(function(x)
+			return x == nil and "nil" or tostring(x)
+		end, { ... }),
+		"\t"
+	)
+	queue[#queue + 1] = msg
 
-	-- Check if at least one argument is given
-	if arg_count < 1 then
-		print("Error: At least one argument is required.")
+	-- 2. if we already have fd → flush
+	if fd then
+		M._flush_queue()
 		return
 	end
 
-	-- Determine if there is only one argument (use as message without category)
-	local message, category
-	if arg_count == 1 then
-		message = args[1]
-		category = nil
-	else
-		-- Multiple arguments: last one is the message, others form the category
-		message = args[arg_count]
-		category = table.concat(vim.list_slice(args, 1, arg_count - 1), "\t")
+	-- 3. ensure a reader exists, then start/continue open attempts
+	ensure_dummy_reader()
+	if not open_timer then
+		open_timer = uv.new_timer()
+		try_open_pipe() -- first immediate attempt
 	end
+end
 
-	-- Open the pipe in append mode
-	local file = io.open(M.config.pipe_path, "a")
-
-	-- Check if the pipe was opened successfully
-	if not file then
-		print("Error: Could not open pipe at " .. M.config.pipe_path)
-		return
+-- cleanup (optional)
+function M.close_pipe()
+	if fd then
+		uv.fs_close(fd)
+		fd = nil
 	end
-
-	-- Format the message, add category if present
-	local formatted_message
-	if category then
-		formatted_message = category .. "\t" .. message
-	else
-		formatted_message = message
+	if open_timer then
+		open_timer:stop()
+		open_timer:close()
+		open_timer = nil
 	end
+	if dummy_pid then
+		uv.process_kill(dummy_pid, 9)
+		dummy_pid = nil
+	end
+end
 
-	-- Write the formatted message to the pipe
-	file:write(formatted_message .. "\n")
-	file:close()
-
-	-- Echo the formatted message in Neovim
-	--print("Sent to pipe: " .. formatted_message)
+-- wrapper with stack trace (unchanged)
+function M.log(...)
+	local st = {}
+	for lvl = 3, math.huge do
+		local info = debug.getinfo(lvl, "Sn")
+		if not info then
+			break
+		end
+		st[#st + 1] = (info.name or "<unknown>") .. "\r" .. (info.short_src or "<unknown>")
+	end
+	M.write(table.concat(st, "\t"), ...)
 end
 
 return M
